@@ -43,3 +43,44 @@ describe("POST /sync", () => {
     expect(rows[0].created_at.toISOString()).toBe("2026-02-10T21:30:00.000Z");
   });
 });
+
+describe("POST /sync/reconcile", () => {
+  it("в отличие от /sync, перезаписывает даже более старую версию", async () => {
+    const fresh = apiOrder({ status: "paid", updatedAt: "2026-02-12T00:00:00Z" });
+    ctx.api.pages.set(null, { items: [fresh], nextCursor: null });
+    await ctx.app.inject({ method: "POST", url: "/sync" });
+
+    const older = { ...fresh, status: "refunded", updatedAt: "2026-02-10T00:00:00Z" };
+    ctx.api.pages.set(null, { items: [older], nextCursor: null });
+    const res = await ctx.app.inject({ method: "POST", url: "/sync/reconcile" });
+    expect(res.json()).toMatchObject({ applied: 1, stale: 0 });
+
+    const { rows } = await ctx.db.query(`SELECT status FROM orders WHERE id = $1`, [fresh.id]);
+    expect(rows[0].status).toBe("refunded");
+  });
+
+  it("не пишет в базу, если данные совпадают с уже сохранёнными", async () => {
+    const o = apiOrder();
+    ctx.api.pages.set(null, { items: [o], nextCursor: null });
+    await ctx.app.inject({ method: "POST", url: "/sync" });
+
+    ctx.api.pages.set(null, { items: [o], nextCursor: null });
+    const res = await ctx.app.inject({ method: "POST", url: "/sync/reconcile" });
+    expect(res.json()).toMatchObject({ applied: 0, unchanged: 1 });
+  });
+
+  it("подтягивает amountPaid, появившийся в API позже, даже если updatedAt не изменился", async () => {
+    const o = apiOrder({ amount: 1000 });
+    ctx.api.pages.set(null, { items: [o], nextCursor: null });
+    await ctx.app.inject({ method: "POST", url: "/sync" });
+
+    // apply() счёл бы это той же версией (updatedAt тот же) и пропустил бы.
+    const withDiscount = { ...o, amount: 1000, amountPaid: 800 };
+    ctx.api.pages.set(null, { items: [withDiscount], nextCursor: null });
+    const res = await ctx.app.inject({ method: "POST", url: "/sync/reconcile" });
+    expect(res.json()).toMatchObject({ applied: 1, unchanged: 0 });
+
+    const { rows } = await ctx.db.query(`SELECT amount_paid_kop FROM orders WHERE id = $1`, [o.id]);
+    expect(Number(rows[0].amount_paid_kop)).toBe(80000);
+  });
+});

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { ValidationError } from "../errors.js";
 import type { Order, OrdersRepository } from "../repositories/orders.js";
+import { shallowEqual } from "../utils/object.js";
 import { parseRub, toKop } from "../utils/money.js";
 import { parseUtc } from "../utils/time.js";
 
@@ -9,25 +10,34 @@ const ExternalOrder = z.object({
   id: z.string().min(1),
   customerId: z.string().min(1),
   amount: z.union([z.number(), z.string()]),
+  amountPaid: z.union([z.number(), z.string()]).optional(),
   status: z.enum(["pending", "paid", "refunded"]),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
 
-export type ApplyResult = "created" | "updated" | "stale";
+export type ApplyResult = "created" | "updated" | "stale" | "unchanged";
 
 export class OrdersService {
   constructor(private readonly orders: OrdersRepository) {}
 
   normalize(raw: unknown): Order {
     const parsed = ExternalOrder.safeParse(raw);
-    if (!parsed.success) throw new ValidationError(`invalid order: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`);
+    if (!parsed.success)
+      throw new ValidationError(
+        `invalid order: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`,
+      );
     const o = parsed.data;
     try {
+      const amountKop = toKop(parseRub(o.amount));
+      // Старые заказы и вебхуки без amountPaid считаем без скидки.
+      const amountPaidKop =
+        o.amountPaid === undefined ? amountKop : toKop(parseRub(o.amountPaid));
       return {
         id: o.id,
         customerId: o.customerId,
-        amountKop: toKop(parseRub(o.amount)),
+        amountKop,
+        amountPaidKop,
         status: o.status,
         createdAt: parseUtc(o.createdAt),
         updatedAt: parseUtc(o.updatedAt),
@@ -45,7 +55,22 @@ export class OrdersService {
   async apply(raw: unknown): Promise<ApplyResult> {
     const incoming = this.normalize(raw);
     const current = await this.orders.get(incoming.id);
-    if (current && current.updatedAt.getTime() >= incoming.updatedAt.getTime()) return "stale";
+    if (current && current.updatedAt.getTime() >= incoming.updatedAt.getTime())
+      return "stale";
+    await this.orders.save(incoming);
+    return current ? "updated" : "created";
+  }
+
+  /**
+   * Принудительно перезаписывает заказ, игнорируя updatedAt.
+   * В отличие от apply(), не предназначен для вебхуков/событий — raw должен быть
+   * текущим состоянием заказа, полученным прямым запросом к API (а не воспроизведённым
+   * событием), поэтому сравнивать версии не нужно: это и есть источник истины.
+   */
+  async reconcile(raw: unknown): Promise<ApplyResult> {
+    const incoming = this.normalize(raw);
+    const current = await this.orders.get(incoming.id);
+    if (current && shallowEqual(current, incoming)) return "unchanged";
     await this.orders.save(incoming);
     return current ? "updated" : "created";
   }
